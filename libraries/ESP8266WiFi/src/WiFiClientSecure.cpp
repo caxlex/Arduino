@@ -26,6 +26,7 @@ extern "C"
 {
 #include "osapi.h"
 #include "ets_sys.h"
+#include "queue.h"
 }
 #include <errno.h>
 #include "debug.h"
@@ -50,6 +51,28 @@ extern "C"
 #define SSL_DEBUG_OPTS 0
 #endif
 
+
+typedef struct BufferItem
+{
+    size_t size;
+    STAILQ_ENTRY(BufferItem) next;
+    uint8_t data[0];
+
+    static BufferItem* Create(const uint8_t* data, size_t size)
+    {
+        BufferItem* newItem = (BufferItem*) calloc(1, sizeof(BufferItem) + size);
+        if (newItem == nullptr) {
+            return nullptr;
+        }
+        newItem->size = size;
+        memcpy(newItem->data, data, size);
+        return newItem;
+    }
+    
+} BufferItem;
+
+typedef STAILQ_HEAD(BufferList, BufferItem) BufferList;
+
 class SSLContext
 {
 public:
@@ -59,6 +82,7 @@ public:
             _ssl_ctx = ssl_ctx_new(SSL_SERVER_VERIFY_LATER | SSL_DEBUG_OPTS | SSL_CONNECT_IN_PARTS | SSL_READ_BLOCKING | SSL_NO_DEFAULT_KEY, 0);
         }
         ++_ssl_ctx_refcnt;
+        STAILQ_INIT(&_writeBuffers);
     }
 
     ~SSLContext()
@@ -139,6 +163,10 @@ public:
         _available -= will_copy;
         if (_available == 0) {
             _read_ptr = nullptr;
+            /* Send pending outgoing data, if any */
+            if (_hasWriteBuffers()) {
+                _writeBuffersSend();
+            }
         }
         return will_copy;
     }
@@ -155,8 +183,32 @@ public:
         --_available;
         if (_available == 0) {
             _read_ptr = nullptr;
+            /* Send pending outgoing data, if any */
+            if (_hasWriteBuffers()) {
+                _writeBuffersSend();
+            }
         }
         return result;
+    }
+
+    int write(const uint8_t* src, size_t size)
+    {
+        if (!_available) {
+            if (_hasWriteBuffers()) {
+                int rc = _writeBuffersSend();
+                if (rc < 0) {
+                    return rc;
+                }
+            }
+            return _write(src, size);
+        }
+        /* Some received data is still present in the axtls fragment buffer.
+           We can't call ssl_write now, as that will overwrite the contents of
+           the fragment buffer, corrupting the received data.
+           Save a copy of the outgoing data, and call ssl_write when all
+           recevied data has been consumed by the application.
+        */
+        return _writeBufferAdd(src, size);
     }
 
     int peek()
@@ -282,12 +334,71 @@ protected:
         return _available;
     }
 
+    int _write(const uint8_t* src, size_t size)
+    {
+        if (!_ssl) {
+            return 0;
+        }
+
+        int rc = ssl_write(_ssl, src, size);
+        if (rc >= 0) {
+            return rc;
+        }
+        return rc;
+    }
+
+    int _writeBufferAdd(const uint8_t* data, size_t size)
+    {
+        if (!_ssl) {
+            return 0;
+        }
+
+        BufferItem* newItem = BufferItem::Create(data, size);
+        if (newItem == nullptr) {
+            return SSL_NOT_OK;
+        }
+        STAILQ_INSERT_TAIL(&_writeBuffers, newItem, next);
+        return size;
+    }
+
+    int _writeBuffersSend()
+    {
+        BufferItem* it;
+        BufferItem* tmp;
+        STAILQ_FOREACH_SAFE(it, &_writeBuffers, next, tmp) {
+            STAILQ_REMOVE_HEAD(&_writeBuffers, next);
+            int rc = _write(it->data, it->size);
+            free(it);
+            if (rc < 0) {
+                _writeBuffersDiscard();
+                return rc;
+            }
+        }
+        return 0;
+    }
+
+    void _writeBuffersDiscard()
+    {
+        BufferItem* it;
+        BufferItem* tmp;
+        STAILQ_FOREACH_SAFE(it, &_writeBuffers, next, tmp) {
+            STAILQ_REMOVE_HEAD(&_writeBuffers, next);
+            free(it);
+        }
+    }
+
+    bool _hasWriteBuffers()
+    {
+        return !STAILQ_EMPTY(&_writeBuffers);
+    }
+
     static SSL_CTX* _ssl_ctx;
     static int _ssl_ctx_refcnt;
     SSL* _ssl = nullptr;
     int _refcnt = 0;
     const uint8_t* _read_ptr = nullptr;
     size_t _available = 0;
+    BufferList _writeBuffers;
     bool _allowSelfSignedCerts = false;
     static ClientContext* s_io_ctx;
 };
@@ -371,7 +482,7 @@ size_t WiFiClientSecure::write(const uint8_t *buf, size_t size)
         return 0;
     }
 
-    int rc = ssl_write(*_ssl, buf, size);
+    int rc = _ssl->write(buf, size);
     if (rc >= 0) {
         return rc;
     }
